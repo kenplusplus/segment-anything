@@ -148,6 +148,19 @@ amg_settings.add_argument(
     ),
 )
 
+amg_settings.add_argument(
+    "--use-trt",
+    action="store_true",
+    help="Use TensorRT for prompt encoder + mask decoder inference.",
+)
+
+amg_settings.add_argument(
+    "--trt-engine",
+    type=str,
+    default=None,
+    help="Path to the TensorRT engine file for the decoder.",
+)
+
 
 def write_masks_to_folder(masks: List[Dict[str, Any]], path: str) -> None:
     header = "id,area,bbox_x0,bbox_y0,bbox_w,bbox_h,point_input_x,point_input_y,predicted_iou,stability_score,crop_box_x0,crop_box_y0,crop_box_w,crop_box_h"  # noqa
@@ -198,7 +211,15 @@ def main(args: argparse.Namespace) -> None:
     _ = sam.to(device=args.device)
     output_mode = "coco_rle" if args.convert_to_rle else "binary_mask"
     amg_kwargs = get_amg_kwargs(args)
-    generator = SamAutomaticMaskGenerator(sam, output_mode=output_mode, **amg_kwargs)
+
+    # TensorRT options are passed directly, not via amg_kwargs
+    generator = SamAutomaticMaskGenerator(
+        sam,
+        output_mode=output_mode,
+        use_trt=args.use_trt,
+        trt_engine_path=args.trt_engine,
+        **amg_kwargs,
+    )
 
     if not os.path.isdir(args.input):
         targets = [args.input]

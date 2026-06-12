@@ -49,6 +49,8 @@ class SamAutomaticMaskGenerator:
         point_grids: Optional[List[np.ndarray]] = None,
         min_mask_region_area: int = 0,
         output_mode: str = "binary_mask",
+        use_trt: bool = False,
+        trt_engine_path: Optional[str] = None,
     ) -> None:
         """
         Using a SAM model, generates masks for the entire image.
@@ -93,6 +95,10 @@ class SamAutomaticMaskGenerator:
             'uncompressed_rle', or 'coco_rle'. 'coco_rle' requires pycocotools.
             For large resolutions, 'binary_mask' may consume large amounts of
             memory.
+          use_trt (bool): If True, use TensorRT for the prompt encoder + mask
+            decoder instead of PyTorch. Requires trt_engine_path to be set.
+          trt_engine_path (str or None): Path to the TensorRT engine file for
+            the decoder. Required when use_trt=True.
         """
 
         assert (points_per_side is None) != (
@@ -132,6 +138,16 @@ class SamAutomaticMaskGenerator:
         self.crop_n_points_downscale_factor = crop_n_points_downscale_factor
         self.min_mask_region_area = min_mask_region_area
         self.output_mode = output_mode
+        self.use_trt = use_trt
+        self.trt_engine_path = trt_engine_path
+
+        if self.use_trt:
+            assert trt_engine_path is not None, "trt_engine_path must be set when use_trt=True"
+            from .utils.tensorrt import SamTensorRT
+
+            self.trt_runner = SamTensorRT(trt_engine_path)
+        else:
+            self.trt_runner = None
 
     @torch.no_grad()
     def generate(self, image: np.ndarray) -> List[Dict[str, Any]]:
@@ -272,16 +288,46 @@ class SamAutomaticMaskGenerator:
     ) -> MaskData:
         orig_h, orig_w = orig_size
 
-        # Run model on this batch
+                # Run model on this batch
         transformed_points = self.predictor.transform.apply_coords(points, im_size)
         in_points = torch.as_tensor(transformed_points, device=self.predictor.device)
-        in_labels = torch.ones(in_points.shape[0], dtype=torch.int, device=in_points.device)
-        masks, iou_preds, _ = self.predictor.predict_torch(
-            in_points[:, None, :],
-            in_labels[:, None],
-            multimask_output=True,
-            return_logits=True,
-        )
+        in_labels = torch.ones(in_points.shape[0], dtype=torch.int, device=self.predictor.device)
+
+        if self.use_trt and self.trt_runner is not None:
+            # TensorRT path: run decoder via TensorRT engine
+            image_embeddings = self.predictor.features
+            point_coords = in_points[:, None, :]      # (B, N, 2)
+            point_labels = in_labels[:, None]         # (B, N)
+
+            # Dummy mask input (zeros = no prior mask)
+            mask_input = torch.zeros(
+                1, 1, 256, 256, dtype=torch.float, device=self.predictor.device
+            )
+            has_mask_input = torch.tensor(
+                [0.0], dtype=torch.float, device=self.predictor.device
+            )
+            orig_im_size = torch.tensor(
+                [orig_h, orig_w], dtype=torch.float, device=self.predictor.device
+            )
+
+            masks, iou_preds, _ = self.trt_runner.infer(
+                image_embeddings,
+                point_coords,
+                point_labels,
+                mask_input,
+                has_mask_input,
+                orig_im_size,
+            )
+            masks = masks.to(in_points.device)
+            iou_preds = iou_preds.to(in_points.device)
+        else:
+            # PyTorch path: encoder + decoder in PyTorch
+            masks, iou_preds, _ = self.predictor.predict_torch(
+                in_points[:, None, :],
+                in_labels[:, None],
+                multimask_output=True,
+                return_logits=True,
+            )
 
         # Serialize predictions and store in MaskData
         data = MaskData(
