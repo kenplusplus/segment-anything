@@ -3,7 +3,7 @@
 
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
-
+import time
 import numpy as np
 import torch
 from torchvision.ops.boxes import batched_nms, box_area  # type: ignore
@@ -158,25 +158,33 @@ class SamAutomaticMaskGenerator:
                crop_box (list(float)): The crop of the image used to generate
                  the mask, given in XYWH format.
         """
+        import time
+        t0 = time.perf_counter()
 
         # Generate masks
         mask_data = self._generate_masks(image)
+        t1 = time.perf_counter()
+        print(f"[Timing] _generate_masks: {t1 - t0:.3f}s")
 
         # Filter small disconnected regions and holes in masks
         if self.min_mask_region_area > 0:
+            t_pp = time.perf_counter()
             mask_data = self.postprocess_small_regions(
                 mask_data,
                 self.min_mask_region_area,
                 max(self.box_nms_thresh, self.crop_nms_thresh),
             )
+            print(f"[Timing] postprocess_small_regions: {time.perf_counter() - t_pp:.3f}s")
 
         # Encode masks
+        t_enc = time.perf_counter()
         if self.output_mode == "coco_rle":
             mask_data["segmentations"] = [coco_encode_rle(rle) for rle in mask_data["rles"]]
         elif self.output_mode == "binary_mask":
             mask_data["segmentations"] = [rle_to_mask(rle) for rle in mask_data["rles"]]
         else:
             mask_data["segmentations"] = mask_data["rles"]
+        print(f"[Timing] encode_masks: {time.perf_counter() - t_enc:.3f}s")
 
         # Write mask records
         curr_anns = []
@@ -192,6 +200,8 @@ class SamAutomaticMaskGenerator:
             }
             curr_anns.append(ann)
 
+        total = time.perf_counter() - t0
+        print(f"[Timing] generate total: {total:.3f}s, {len(curr_anns)} masks produced")
         return curr_anns
 
     def _generate_masks(self, image: np.ndarray) -> MaskData:
@@ -202,9 +212,11 @@ class SamAutomaticMaskGenerator:
 
         # Iterate over image crops
         data = MaskData()
+        t_crop = time.perf_counter()
         for crop_box, layer_idx in zip(crop_boxes, layer_idxs):
             crop_data = self._process_crop(image, crop_box, layer_idx, orig_size)
             data.cat(crop_data)
+        print(f"[Timing] all crops (N={len(crop_boxes)}): {time.perf_counter() - t_crop:.3f}s")
 
         # Remove duplicate masks between crops
         if len(crop_boxes) > 1:
@@ -229,6 +241,9 @@ class SamAutomaticMaskGenerator:
         crop_layer_idx: int,
         orig_size: Tuple[int, ...],
     ) -> MaskData:
+        import time
+        t0 = time.perf_counter()
+
         # Crop the image and calculate embeddings
         x0, y0, x1, y1 = crop_box
         cropped_im = image[y0:y1, x0:x1, :]
@@ -246,6 +261,7 @@ class SamAutomaticMaskGenerator:
             data.cat(batch_data)
             del batch_data
         self.predictor.reset_image()
+        print(f"[Timing] _process_crop layer={crop_layer_idx} crop={crop_box}: {time.perf_counter() - t0:.3f}s")
 
         # Remove duplicates within this crop.
         keep_by_nms = batched_nms(
