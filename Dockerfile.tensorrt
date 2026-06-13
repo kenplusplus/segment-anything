@@ -31,4 +31,4 @@ ENV PYTHONPATH=/workspace/segment_anything/:${PYTHONPATH}
 
 WORKDIR /workspace
 
-CMD ["python", "scripts/amg.py", "--help"]
+CMD ["/workspace/segment_anything/start_test.sh"]
