@@ -350,40 +350,36 @@ class SamAutomaticMaskGenerator:
             masks = masks.to(in_points.device)
             iou_preds = iou_preds.to(in_points.device)
         elif self.use_ort and self.ort_runner is not None:
-            # ONNX Runtime GPU path: ONNX returns 4 masks per single point,
-            # so we loop one point at a time and concatenate results.
+            # ONNX Runtime GPU path. The exported decoder only takes
+            # B=1, so we must loop one point at a time. The
+            # SamONNXRunner pre-allocates the constant numpy buffers
+            # (mask_input, has_mask_input) and avoids per-call Python
+            # tensor creation, which is the cheapest loop body that
+            # works with the existing ONNX export.
             image_embeddings = self.predictor.features
-            mask_input = torch.zeros(
-                1, 1, 256, 256, dtype=torch.float, device=self.predictor.device
-            )
-            has_mask_input = torch.tensor(
-                [0.0], dtype=torch.float, device=self.predictor.device
-            )
             orig_im_size = torch.tensor(
                 [orig_h, orig_w], dtype=torch.float, device=self.predictor.device
             )
 
             all_masks, all_ious = [], []
             for i in range(len(in_points)):
-                # Single point: (1, 1, 2) and (1,)
-                pt_coord = in_points[i].unsqueeze(0).unsqueeze(0)   # (1, 1, 2)
-                pt_label = torch.tensor([1.0], dtype=torch.float, device=in_points.device).unsqueeze(0)  # (1,)
-
+                pt_coord = in_points[i].view(1, 1, 2)
+                pt_label = torch.ones(1, 1, dtype=torch.float, device=in_points.device)
                 m, iou, _ = self.ort_runner.infer(
                     image_embeddings,
                     pt_coord,
                     pt_label,
-                    mask_input,
-                    has_mask_input,
+                    None,  # use pre-allocated zeros in runner
+                    None,  # use pre-allocated zeros in runner
                     orig_im_size,
                 )
-                all_masks.append(m.squeeze(0))   # (4, H, W)
-                all_ious.append(iou.squeeze(0))  # (4,)
+                all_masks.append(m)  # (1, 4, H, W) CPU tensor
+                all_ious.append(iou)  # (1, 4) CPU tensor
 
-            masks = torch.cat(all_masks, dim=0)    # (N*4, H, W)
-            iou_preds = torch.cat(all_ious, dim=0)  # (N*4,)
-            masks = masks.unsqueeze(1)              # (N*4, 1, H, W)
-            iou_preds = iou_preds.unsqueeze(1)      # (N*4, 1)
+            masks = torch.cat(all_masks, dim=0)     # (N, 4, H, W) on CPU
+            iou_preds = torch.cat(all_ious, dim=0)  # (N, 4) on CPU
+            masks = masks.flatten(0, 1).unsqueeze(1).to(self.predictor.device, non_blocking=True)
+            iou_preds = iou_preds.flatten(0, 1).unsqueeze(1).to(self.predictor.device, non_blocking=True)
         else:
             # PyTorch path: encoder + decoder in PyTorch
             masks, iou_preds, _ = self.predictor.predict_torch(
