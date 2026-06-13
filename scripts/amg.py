@@ -11,6 +11,7 @@ from segment_anything import SamAutomaticMaskGenerator, sam_model_registry
 import argparse
 import json
 import os
+import time
 from typing import Any, Dict, List
 
 parser = argparse.ArgumentParser(
@@ -161,6 +162,19 @@ amg_settings.add_argument(
     help="Path to the TensorRT engine file for the decoder.",
 )
 
+amg_settings.add_argument(
+    "--use-ort",
+    action="store_true",
+    help="Use ONNX Runtime GPU for prompt encoder + mask decoder inference.",
+)
+
+amg_settings.add_argument(
+    "--ort-engine",
+    type=str,
+    default=None,
+    help="Path to the ONNX model file for the decoder.",
+)
+
 
 def write_masks_to_folder(masks: List[Dict[str, Any]], path: str) -> None:
     header = "id,area,bbox_x0,bbox_y0,bbox_w,bbox_h,point_input_x,point_input_y,predicted_iou,stability_score,crop_box_x0,crop_box_y0,crop_box_w,crop_box_h"  # noqa
@@ -212,12 +226,14 @@ def main(args: argparse.Namespace) -> None:
     output_mode = "coco_rle" if args.convert_to_rle else "binary_mask"
     amg_kwargs = get_amg_kwargs(args)
 
-    # TensorRT options are passed directly, not via amg_kwargs
+    # TensorRT / ONNX Runtime options are passed directly, not via amg_kwargs
     generator = SamAutomaticMaskGenerator(
         sam,
         output_mode=output_mode,
         use_trt=args.use_trt,
         trt_engine_path=args.trt_engine,
+        use_ort=args.use_ort,
+        ort_engine_path=args.ort_engine,
         **amg_kwargs,
     )
 
@@ -233,13 +249,17 @@ def main(args: argparse.Namespace) -> None:
 
     for t in targets:
         print(f"Processing '{t}'...")
+        t_img = time.perf_counter()
         image = cv2.imread(t)
         if image is None:
             print(f"Could not load '{t}' as an image, skipping...")
             continue
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
 
+        t_gen = time.perf_counter()
         masks = generator.generate(image)
+        t_gen = time.perf_counter() - t_gen
+        print(f"[amg.py] generate() took {t_gen:.3f}s for {len(masks)} masks")
 
         base = os.path.basename(t)
         base = os.path.splitext(base)[0]

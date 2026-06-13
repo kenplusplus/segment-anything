@@ -51,6 +51,8 @@ class SamAutomaticMaskGenerator:
         output_mode: str = "binary_mask",
         use_trt: bool = False,
         trt_engine_path: Optional[str] = None,
+        use_ort: bool = False,
+        ort_engine_path: Optional[str] = None,
     ) -> None:
         """
         Using a SAM model, generates masks for the entire image.
@@ -99,6 +101,10 @@ class SamAutomaticMaskGenerator:
             decoder instead of PyTorch. Requires trt_engine_path to be set.
           trt_engine_path (str or None): Path to the TensorRT engine file for
             the decoder. Required when use_trt=True.
+          use_ort (bool): If True, use ONNX Runtime GPU for the prompt encoder
+            + mask decoder instead of PyTorch. Requires ort_engine_path to be set.
+          ort_engine_path (str or None): Path to the ONNX model file for the
+            decoder. Required when use_ort=True.
         """
 
         assert (points_per_side is None) != (
@@ -140,14 +146,24 @@ class SamAutomaticMaskGenerator:
         self.output_mode = output_mode
         self.use_trt = use_trt
         self.trt_engine_path = trt_engine_path
+        self.use_ort = use_ort
+        self.ort_engine_path = ort_engine_path
 
         if self.use_trt:
             assert trt_engine_path is not None, "trt_engine_path must be set when use_trt=True"
             from .utils.tensorrt import SamTensorRT
 
             self.trt_runner = SamTensorRT(trt_engine_path)
+            self.ort_runner = None
+        elif self.use_ort:
+            assert ort_engine_path is not None, "ort_engine_path must be set when use_ort=True"
+            from .utils.onnx_runner import SamONNXRunner
+
+            self.ort_runner = SamONNXRunner(ort_engine_path)
+            self.trt_runner = None
         else:
             self.trt_runner = None
+            self.ort_runner = None
 
     @torch.no_grad()
     def generate(self, image: np.ndarray) -> List[Dict[str, Any]]:
@@ -174,25 +190,33 @@ class SamAutomaticMaskGenerator:
                crop_box (list(float)): The crop of the image used to generate
                  the mask, given in XYWH format.
         """
+        import time
+        t0 = time.perf_counter()
 
         # Generate masks
         mask_data = self._generate_masks(image)
+        t1 = time.perf_counter()
+        print(f"[Timing] _generate_masks: {t1 - t0:.3f}s")
 
         # Filter small disconnected regions and holes in masks
         if self.min_mask_region_area > 0:
+            t2 = time.perf_counter()
             mask_data = self.postprocess_small_regions(
                 mask_data,
                 self.min_mask_region_area,
                 max(self.box_nms_thresh, self.crop_nms_thresh),
             )
+            print(f"[Timing] postprocess_small_regions: {time.perf_counter() - t2:.3f}s")
 
         # Encode masks
+        t3 = time.perf_counter()
         if self.output_mode == "coco_rle":
             mask_data["segmentations"] = [coco_encode_rle(rle) for rle in mask_data["rles"]]
         elif self.output_mode == "binary_mask":
             mask_data["segmentations"] = [rle_to_mask(rle) for rle in mask_data["rles"]]
         else:
             mask_data["segmentations"] = mask_data["rles"]
+        print(f"[Timing] encode_masks: {time.perf_counter() - t3:.3f}s")
 
         # Write mask records
         curr_anns = []
@@ -207,6 +231,9 @@ class SamAutomaticMaskGenerator:
                 "crop_box": box_xyxy_to_xywh(mask_data["crop_boxes"][idx]).tolist(),
             }
             curr_anns.append(ann)
+
+        total = time.perf_counter() - t0
+        print(f"[Timing] generate total: {total:.3f}s, {len(curr_anns)} masks produced")
 
         return curr_anns
 
@@ -286,13 +313,15 @@ class SamAutomaticMaskGenerator:
         crop_box: List[int],
         orig_size: Tuple[int, ...],
     ) -> MaskData:
+        import time
         orig_h, orig_w = orig_size
 
-                # Run model on this batch
+        # Run model on this batch
         transformed_points = self.predictor.transform.apply_coords(points, im_size)
         in_points = torch.as_tensor(transformed_points, device=self.predictor.device)
         in_labels = torch.ones(in_points.shape[0], dtype=torch.int, device=self.predictor.device)
 
+        t_inf = time.perf_counter()
         if self.use_trt and self.trt_runner is not None:
             # TensorRT path: run decoder via TensorRT engine
             image_embeddings = self.predictor.features
@@ -320,6 +349,41 @@ class SamAutomaticMaskGenerator:
             )
             masks = masks.to(in_points.device)
             iou_preds = iou_preds.to(in_points.device)
+        elif self.use_ort and self.ort_runner is not None:
+            # ONNX Runtime GPU path: ONNX returns 4 masks per single point,
+            # so we loop one point at a time and concatenate results.
+            image_embeddings = self.predictor.features
+            mask_input = torch.zeros(
+                1, 1, 256, 256, dtype=torch.float, device=self.predictor.device
+            )
+            has_mask_input = torch.tensor(
+                [0.0], dtype=torch.float, device=self.predictor.device
+            )
+            orig_im_size = torch.tensor(
+                [orig_h, orig_w], dtype=torch.float, device=self.predictor.device
+            )
+
+            all_masks, all_ious = [], []
+            for i in range(len(in_points)):
+                # Single point: (1, 1, 2) and (1,)
+                pt_coord = in_points[i].unsqueeze(0).unsqueeze(0)   # (1, 1, 2)
+                pt_label = torch.tensor([1.0], dtype=torch.float, device=in_points.device).unsqueeze(0)  # (1,)
+
+                m, iou, _ = self.ort_runner.infer(
+                    image_embeddings,
+                    pt_coord,
+                    pt_label,
+                    mask_input,
+                    has_mask_input,
+                    orig_im_size,
+                )
+                all_masks.append(m.squeeze(0))   # (4, H, W)
+                all_ious.append(iou.squeeze(0))  # (4,)
+
+            masks = torch.cat(all_masks, dim=0)    # (N*4, H, W)
+            iou_preds = torch.cat(all_ious, dim=0)  # (N*4,)
+            masks = masks.unsqueeze(1)              # (N*4, 1, H, W)
+            iou_preds = iou_preds.unsqueeze(1)      # (N*4, 1)
         else:
             # PyTorch path: encoder + decoder in PyTorch
             masks, iou_preds, _ = self.predictor.predict_torch(
@@ -328,12 +392,14 @@ class SamAutomaticMaskGenerator:
                 multimask_output=True,
                 return_logits=True,
             )
+        print(f"[Timing] _process_batch inference: {time.perf_counter() - t_inf:.3f}s ({len(in_points)} points)")
 
         # Serialize predictions and store in MaskData
+        # multimask_output=True always produces 4 masks per point
         data = MaskData(
             masks=masks.flatten(0, 1),
             iou_preds=iou_preds.flatten(0, 1),
-            points=torch.as_tensor(points.repeat(masks.shape[1], axis=0)),
+            points=torch.as_tensor(points.repeat(4, axis=0)),
         )
         del masks
 
