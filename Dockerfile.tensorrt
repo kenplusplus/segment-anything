@@ -17,13 +17,29 @@
 
 FROM nvcr.io/nvidia/tensorrt:24.09-py3
 
-RUN apt-get update && apt-get install -y --no-install-recommends libgl1 libglib2.0-0 libsm6 libxext6 libxrender-dev tmux && rm -rf /var/lib/apt/lists/*
+RUN cp /etc/apt/sources.list /etc/apt/sources.list.bak && \
+    echo "deb http://mirrors.aliyun.com/ubuntu/ jammy main restricted universe multiverse" > /etc/apt/sources.list && \
+    echo "deb http://mirrors.aliyun.com/ubuntu/ jammy-security main restricted universe multiverse" >> /etc/apt/sources.list && \
+    echo "deb http://mirrors.aliyun.com/ubuntu/ jammy-updates main restricted universe multiverse" >> /etc/apt/sources.list && \
+    echo "deb http://mirrors.aliyun.com/ubuntu/ jammy-backports main restricted universe multiverse" >> /etc/apt/sources.list
 
-RUN pip install --no-cache-dir torch==2.4.0 torchvision==0.19.0 torchaudio==2.4.0 --index-url https://download.pytorch.org/whl/cu121
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends libgl1 libglib2.0-0 libsm6 libxext6 libxrender-dev tmux && \
+    rm -rf /var/lib/apt/lists/*
+
+
+RUN pip install --no-cache-dir torch==2.4.0 torchvision==0.19.0 torchaudio==2.4.0 \
+    -i https://pypi.tuna.tsinghua.edu.cn/simple
 
 COPY . /workspace/segment_anything/
 
-RUN pip install --no-cache-dir -e /workspace/segment_anything && pip install --no-cache-dir opencv-python pycocotools matplotlib onnxruntime-gpu onnx numpy
+RUN pip install --no-cache-dir -e /workspace/segment_anything && \
+    pip install --no-cache-dir opencv-python pycocotools matplotlib onnxruntime-gpu onnx numpy -i https://pypi.tuna.tsinghua.edu.cn/simple
+
+# Install Node.js and Claude Code CLI
+RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
+    && apt-get install -y nodejs \
+    && npm install -g @anthropic-ai/claude-code --registry=https://registry.npmmirror.com
 
 ENV PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 ENV LD_LIBRARY_PATH=/usr/local/tensorrt/lib:${LD_LIBRARY_PATH}
