@@ -220,11 +220,11 @@ def main(args: argparse.Namespace) -> None:
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
 
         # Resize to max 512 on longer side to avoid OOM during filter()
-        max_dim = 512
-        h, w = image.shape[:2]
-        if max(h, w) > max_dim:
-            scale = max_dim / max(h, w)
-            image = cv2.resize(image, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_LANCZOS4)
+        #max_dim = 512
+        #h, w = image.shape[:2]
+        #if max(h, w) > max_dim:
+        #    scale = max_dim / max(h, w)
+        #    image = cv2.resize(image, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_LANCZOS4)
 
         # Clear CUDA memory before each generation
         import torch
